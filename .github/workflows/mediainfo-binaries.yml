@@ -187,34 +187,51 @@ jobs:
           cd "$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/ZenLib/Project/GNU/Library"
           if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
           ./configure --enable-static --disable-shared
-          # Bypass MinGW libtool's refusal to absorb a static archive into a DLL.
+          # Two stacked problems are fixed in this single sed:
           #
-          # Background: MediaInfoLib/configure.ac (v26.01 lines 471-473) appends
-          #   $(libzen-config LIBS_Static)
-          # to LIBS verbatim. ZenLib bakes that as ".../.libs/libzen.a -lpthread", and
-          # libtool on MinGW has two stacked safety checks against linking a static-
-          # only ZenLib into the libmediainfo DLL:
-          #   - bare .a path  -> "Trying to link with static lib archive ... the file
-          #     extensions .a of this argument makes me believe that it is just a
-          #     static archive that I should not use here."
-          #   - .la wrapper, installed=yes, dlname='' -> "This system cannot link to
-          #     static lib archive ... you do not appear to have a shared version."
-          # Both branches silently drop ZenLib from the link command, leaving every
-          # ZenLib::* symbol unresolved in libmediainfo-0.dll.
+          # (A) MinGW libtool refuses to absorb a static archive into a DLL.
+          #     MediaInfoLib/configure.ac (v26.01 lines 471-473) appends
+          #       $(libzen-config LIBS_Static)
+          #     to LIBS verbatim, and ZenLib bakes that as ".../.libs/libzen.a -lpthread".
+          #     libtool on MinGW has two stacked safety checks against the static-only
+          #     ZenLib:
+          #       - bare .a path  -> "Trying to link with static lib archive ... the
+          #         file extensions .a of this argument makes me believe that it is
+          #         just a static archive that I should not use here."
+          #       - .la wrapper, installed=yes, dlname='' -> "This system cannot link
+          #         to static lib archive ... you do not appear to have a shared
+          #         version."
+          #     Both branches silently drop ZenLib, leaving every ZenLib::* symbol
+          #     unresolved.
           #
-          # Fix: re-emit the path with a "-Wl," prefix. libtool's func_mode_link has a
-          # dedicated `-Wl,*) ... compile_command="$compile_command $wl$flag"` branch
-          # that pass-throughs each comma-separated token directly to the linker
-          # without going near library-resolution logic. g++ then forwards the bare
-          # path to ld, which absorbs the archive's objects into the resulting DLL
-          # exactly the way libtool was supposed to. Same trick is used by OpenSSL,
-          # Qt and Boost on MinGW for the same reason.
+          # (B) Even after (A) is bypassed, GNU ld's strict left-to-right archive
+          #     scan still fails: libtool emits LIBS at the very tail of the link
+          #     command (`... -lstdc++ ... -lgcc_s ... crtend.o -O2 -Wl,libzen.a`),
+          #     so by the time ld pulls Ztring.o out of libzen.a it has already
+          #     moved past -lstdc++. ZenLib's wchar_t stream usage in Ztring.cpp
+          #     (lines 1915, 1991, 2067 ...) then surfaces as hundreds of
+          #       undefined reference to `std::__cxx11::basic_stringstream<wchar_t,
+          #         std::char_traits<wchar_t>, std::allocator<wchar_t> >::~basic_stringstream()'
+          #     and similar. This is the classic GNU ld "library order" pitfall.
           #
-          # Linux is unaffected at runtime (GNU ld absorbs the bare .a regardless),
-          # but the same transformation is harmless there: ld accepts `-Wl,/path/.a`
-          # identically to a bare path. We only apply it here because configure on
-          # mingw is the only host that hits the libtool refusal.
-          sed -i 's|\([^"'\''[:space:]]*\.libs/libzen\.a\)|-Wl,\1|g' libzen-config
+          # Fix for both at once: rewrite the LIBS_Static path so libtool sees it as
+          # a single `-Wl,*` token bundling libzen.a *and* -lstdc++ inside a
+          #   --start-group ... --end-group
+          # pair. libtool's func_mode_link `-Wl,*)` branch splits on commas and
+          # passes each piece through to ld unchanged, so:
+          #   1. (A) is bypassed because libtool never sees libzen.a as a "library"
+          #      to validate -- it treats every comma-separated token as an opaque
+          #      linker flag (same trick OpenSSL / Qt / Boost use on MinGW).
+          #   2. (B) is fixed because --start-group/--end-group force ld to re-scan
+          #      libzen.a and libstdc++ until all references resolve, regardless of
+          #      where the bundle lands in the link line.
+          # -lpthread stays outside the group: it is left as-is at the tail of
+          # LIBS_Static and processed by libtool's normal `-l*` deplibs path.
+          #
+          # Linux is unaffected: GNU ld there absorbs the bare .a regardless, but
+          # the rewrite is also harmless there (ld accepts `--start-group/.../-lstdc++/--end-group`
+          # identically). We only need this on mingw where both (A) and (B) bite.
+          sed -i 's|\([^"'\''[:space:]]*\.libs/libzen\.a\)|-Wl,--start-group,\1,-lstdc++,--end-group|g' libzen-config
           make -j"$(nproc)"
 
       - name: Build MediaInfoLib (shared, no libcurl/libmms)
@@ -253,12 +270,15 @@ jobs:
             exit 1
           fi
 
-          # (2) Regression guard for the libtool static-absorption bug we just fixed
-          # via the "-Wl," pass-through patch on libzen-config (see Build ZenLib step).
-          # If MinGW libtool ever drops ZenLib again (upstream changes the bake-in
-          # path, libtool gets stricter, the sed pattern stops matching, etc.) the
-          # build still "succeeds" but produces a DLL that crashes at runtime with
-          # unresolved ZenLib symbols. This catches it in CI.
+          # (2) Regression guard for the two-stacked libtool/ld bug we fixed via
+          # the "-Wl,--start-group,...,libzen.a,-lstdc++,--end-group" patch on
+          # libzen-config (see Build ZenLib step):
+          #   - libtool no longer drops ZenLib (`-Wl,*` bypass), AND
+          #   - ld no longer fails Ztring.o's wchar_t std::* refs (group re-scan).
+          # If either ever regresses (upstream renames the bake-in path, libtool
+          # gets stricter, sed pattern stops matching, ld changes group semantics)
+          # the build either crashes here at link time or "succeeds" but produces
+          # a DLL that fails at runtime. This nm check catches the silent variant.
           if ! nm -C --defined-only "$SRC" | grep -qE 'ZenLib::(Ztring|CriticalSection)' ; then
             echo "ERROR: ZenLib symbols not absorbed into $(basename "$SRC")"
             echo "----- ZenLib symbols seen by nm -C (defined or not): -----"
