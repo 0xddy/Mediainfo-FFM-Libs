@@ -187,32 +187,35 @@ jobs:
           cd "$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/ZenLib/Project/GNU/Library"
           if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
           ./configure --enable-static --disable-shared
-          # Patch 1/2 (post-configure): re-point libzen-config at the libtool .la wrapper
-          # rather than the bare .a. MediaInfoLib's configure.ac (lines 471-473) appends
+          # Bypass MinGW libtool's refusal to absorb a static archive into a DLL.
+          #
+          # Background: MediaInfoLib/configure.ac (v26.01 lines 471-473) appends
           #   $(libzen-config LIBS_Static)
-          # to LIBS verbatim. Without this patch that becomes ".../.libs/libzen.a", and
-          # MinGW libtool refuses the bare archive ("Trying to link with static lib
-          # archive ... the file extensions .a of this argument makes me believe that it
-          # is just a static archive that I should not use here.") and silently drops it,
-          # leaving every ZenLib::* symbol unresolved in libmediainfo-0.dll.
-          sed -i 's|/\.libs/libzen\.a|/libzen.la|g' libzen-config
+          # to LIBS verbatim. ZenLib bakes that as ".../.libs/libzen.a -lpthread", and
+          # libtool on MinGW has two stacked safety checks against linking a static-
+          # only ZenLib into the libmediainfo DLL:
+          #   - bare .a path  -> "Trying to link with static lib archive ... the file
+          #     extensions .a of this argument makes me believe that it is just a
+          #     static archive that I should not use here."
+          #   - .la wrapper, installed=yes, dlname='' -> "This system cannot link to
+          #     static lib archive ... you do not appear to have a shared version."
+          # Both branches silently drop ZenLib from the link command, leaving every
+          # ZenLib::* symbol unresolved in libmediainfo-0.dll.
+          #
+          # Fix: re-emit the path with a "-Wl," prefix. libtool's func_mode_link has a
+          # dedicated `-Wl,*) ... compile_command="$compile_command $wl$flag"` branch
+          # that pass-throughs each comma-separated token directly to the linker
+          # without going near library-resolution logic. g++ then forwards the bare
+          # path to ld, which absorbs the archive's objects into the resulting DLL
+          # exactly the way libtool was supposed to. Same trick is used by OpenSSL,
+          # Qt and Boost on MinGW for the same reason.
+          #
+          # Linux is unaffected at runtime (GNU ld absorbs the bare .a regardless),
+          # but the same transformation is harmless there: ld accepts `-Wl,/path/.a`
+          # identically to a bare path. We only apply it here because configure on
+          # mingw is the only host that hits the libtool refusal.
+          sed -i 's|\([^"'\''[:space:]]*\.libs/libzen\.a\)|-Wl,\1|g' libzen-config
           make -j"$(nproc)"
-          # Patch 2/2 (post-make): mark libzen.la as a libtool convenience archive
-          # (installed=no) so MediaInfoLib's libtool absorbs its objects into
-          # libmediainfo-0.dll. Even after Patch 1, libtool on MinGW reads the .la with
-          # installed=yes + dlname='' and emits a *different* refusal:
-          #   "This system cannot link to static lib archive .../libzen.la. ... But I
-          #    can only do this if you have a shared version of the library, which you
-          #    do not appear to have."
-          # That branch is hard-coded against linking an *installed* static-only library
-          # into a shared target; a *non-installed* (convenience) static-only library is
-          # explicitly supported and gets its objects copied into the parent .so/.dll.
-          # libzen.la's old_library='libzen.a' is found under ./.libs/ relative to the
-          # .la, which is exactly where libtool looks for convenience archives, so no
-          # path rewrite is needed beyond installed=yes -> installed=no.
-          # (Linux is unaffected: GNU ld absorbs the bare .a regardless of installed=,
-          # and PIC was already enforced by ZenLib/configure.ac for non-mingw builds.)
-          sed -i 's|^installed=yes$|installed=no|' libzen.la
 
       - name: Build MediaInfoLib (shared, no libcurl/libmms)
         shell: msys2 {0}
@@ -251,10 +254,11 @@ jobs:
           fi
 
           # (2) Regression guard for the libtool static-absorption bug we just fixed
-          # (Patch 1: libzen-config -> .la wrapper; Patch 2: libzen.la installed=no).
-          # If MinGW libtool ever drops ZenLib again (upstream changes, libtool
-          # version bump, etc.) the build still "succeeds" but produces a DLL that
-          # crashes at runtime with unresolved ZenLib symbols. This catches it in CI.
+          # via the "-Wl," pass-through patch on libzen-config (see Build ZenLib step).
+          # If MinGW libtool ever drops ZenLib again (upstream changes the bake-in
+          # path, libtool gets stricter, the sed pattern stops matching, etc.) the
+          # build still "succeeds" but produces a DLL that crashes at runtime with
+          # unresolved ZenLib symbols. This catches it in CI.
           if ! nm -C --defined-only "$SRC" | grep -qE 'ZenLib::(Ztring|CriticalSection)' ; then
             echo "ERROR: ZenLib symbols not absorbed into $(basename "$SRC")"
             echo "----- ZenLib symbols seen by nm -C (defined or not): -----"
