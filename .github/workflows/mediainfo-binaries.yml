@@ -156,6 +156,21 @@ jobs:
           cd "$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/ZenLib/Project/GNU/Library"
           if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
           ./configure --enable-static --disable-shared
+          # MinGW libtool refuses to absorb a raw libzen.a into a downstream DLL:
+          #   "Trying to link with static lib archive .../libzen.a. ... But I can only do
+          #    this if you have a shared version of the library, which you do not appear
+          #    to have because the file extensions .a of this argument makes me believe
+          #    that it is just a static archive that I should not use here."
+          # ZenLib's configure bakes "$(pwd)/.libs/libzen.a -lpthread" into libzen-config's
+          # LIBS_Static output, which MediaInfoLib's configure appends to LIBS verbatim
+          # (configure.ac: "LIBS=\"$LIBS \$(libzen-config LIBS_Static)\""), so libtool
+          # silently drops libzen.a and produces a libmediainfo-0.dll missing every
+          # ZenLib::* symbol. Re-point libzen-config at the libtool .la wrapper instead:
+          # libzen.la has dlname='' + old_library='libzen.a', so MediaInfoLib's libtool
+          # treats ZenLib as a convenience library and absorbs its objects into
+          # libmediainfo-0.dll. Linux ld is more permissive and absorbs the bare .a
+          # already, so this is a no-op there; we only need it on MinGW.
+          sed -i 's|/\.libs/libzen\.a|/libzen.la|g' libzen-config
           make -j"$(nproc)"
 
       - name: Build MediaInfoLib (shared, no libcurl/libmms)
