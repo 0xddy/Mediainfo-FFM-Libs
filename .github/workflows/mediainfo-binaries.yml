@@ -187,51 +187,66 @@ jobs:
           cd "$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/ZenLib/Project/GNU/Library"
           if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
           ./configure --enable-static --disable-shared
-          # Two stacked problems are fixed in this single sed:
+          # Three stacked problems on MinGW are fixed in this single sed. All three
+          # showed up in turn during 2026-05-10 CI iteration; keeping the full
+          # narrative here so future maintainers don't peel them again:
           #
           # (A) MinGW libtool refuses to absorb a static archive into a DLL.
           #     MediaInfoLib/configure.ac (v26.01 lines 471-473) appends
           #       $(libzen-config LIBS_Static)
           #     to LIBS verbatim, and ZenLib bakes that as ".../.libs/libzen.a -lpthread".
-          #     libtool on MinGW has two stacked safety checks against the static-only
-          #     ZenLib:
+          #     libtool on MinGW has two stacked safety checks against the
+          #     static-only ZenLib that both silently drop it:
           #       - bare .a path  -> "Trying to link with static lib archive ... the
           #         file extensions .a of this argument makes me believe that it is
           #         just a static archive that I should not use here."
           #       - .la wrapper, installed=yes, dlname='' -> "This system cannot link
           #         to static lib archive ... you do not appear to have a shared
           #         version."
-          #     Both branches silently drop ZenLib, leaving every ZenLib::* symbol
-          #     unresolved.
           #
-          # (B) Even after (A) is bypassed, GNU ld's strict left-to-right archive
-          #     scan still fails: libtool emits LIBS at the very tail of the link
-          #     command (`... -lstdc++ ... -lgcc_s ... crtend.o -O2 -Wl,libzen.a`),
-          #     so by the time ld pulls Ztring.o out of libzen.a it has already
-          #     moved past -lstdc++. ZenLib's wchar_t stream usage in Ztring.cpp
-          #     (lines 1915, 1991, 2067 ...) then surfaces as hundreds of
+          # (B) Once libzen.a is back in the link line, GNU ld's strict left-to-
+          #     right archive scan still mis-orders it: libtool emits LIBS at the
+          #     very tail of the link command (`... -lstdc++ ... -lgcc_s ...
+          #     crtend.o -O2 -Wl,libzen.a`), so when ld pulls Ztring.o out of
+          #     libzen.a it has already moved past -lstdc++. ZenLib's wchar_t
+          #     stream usage in Ztring.cpp (lines 1915, 1991, 2067 ...) then
+          #     surfaces as hundreds of
           #       undefined reference to `std::__cxx11::basic_stringstream<wchar_t,
           #         std::char_traits<wchar_t>, std::allocator<wchar_t> >::~basic_stringstream()'
-          #     and similar. This is the classic GNU ld "library order" pitfall.
           #
-          # Fix for both at once: rewrite the LIBS_Static path so libtool sees it as
-          # a single `-Wl,*` token bundling libzen.a *and* -lstdc++ inside a
+          # (C) Same ordering problem repeats for every other library that ZenLib
+          #     touches on Windows but the link line lists *before* libzen.a:
+          #       - libkernel32 (`__imp_GetFileAttributesW`, `__imp_CreateFileW`,
+          #         `__imp_FindFirstFileW`, `__imp_GetFileTime`, `__imp_CopyFileW`,
+          #         `__imp_DeleteFileW`, `__imp_ResumeThread`, ... in Dir.cpp /
+          #         File.cpp / FileName.cpp / Thread.cpp)
+          #       - libmsvcrt (`_localtime64`, `_gmtime64`, `wcsncpy`,
+          #         `__imp__beginthreadex` in Ztring.cpp / Thread.cpp)
+          #       - libmingwex (`fmodf`, `fmod`, `fmodl` in int128u.cpp)
+          #
+          # Fix for (A)+(B)+(C) at once: rewrite the LIBS_Static path so libtool
+          # sees a single `-Wl,*` token bundling libzen.a together with every
+          # library it ever resolves against, all wrapped in a
           #   --start-group ... --end-group
           # pair. libtool's func_mode_link `-Wl,*)` branch splits on commas and
-          # passes each piece through to ld unchanged, so:
+          # forwards each piece to ld unchanged, so:
           #   1. (A) is bypassed because libtool never sees libzen.a as a "library"
-          #      to validate -- it treats every comma-separated token as an opaque
-          #      linker flag (same trick OpenSSL / Qt / Boost use on MinGW).
-          #   2. (B) is fixed because --start-group/--end-group force ld to re-scan
-          #      libzen.a and libstdc++ until all references resolve, regardless of
-          #      where the bundle lands in the link line.
-          # -lpthread stays outside the group: it is left as-is at the tail of
-          # LIBS_Static and processed by libtool's normal `-l*` deplibs path.
+          #      to validate -- every comma-separated token is opaque to libtool
+          #      (same trick OpenSSL / Qt / Boost use on MinGW).
+          #   2. (B)+(C) are fixed because --start-group/--end-group makes ld
+          #      re-scan the bundled libraries until all references resolve,
+          #      regardless of where the bundle lands in the link line.
+          #
+          # The library list inside the group must cover *everything* ZenLib's
+          # objects (Dir.o / File.o / Ztring.o / Thread.o / int128u.o / etc.)
+          # could possibly need. Repeating libs that are already earlier in the
+          # link line is harmless -- ld just resolves the same import-table entry
+          # twice. -lpthread stays outside as ZenLib's normal -l* deplib too.
           #
           # Linux is unaffected: GNU ld there absorbs the bare .a regardless, but
-          # the rewrite is also harmless there (ld accepts `--start-group/.../-lstdc++/--end-group`
-          # identically). We only need this on mingw where both (A) and (B) bite.
-          sed -i 's|\([^"'\''[:space:]]*\.libs/libzen\.a\)|-Wl,--start-group,\1,-lstdc++,--end-group|g' libzen-config
+          # the rewrite is also harmless there (ld accepts the same group syntax
+          # identically). We only need this on mingw where (A)+(B)+(C) bite.
+          sed -i 's|\([^"'\''[:space:]]*\.libs/libzen\.a\)|-Wl,--start-group,\1,-lstdc++,-lmingwex,-lmsvcrt,-lkernel32,-lgcc_s,-lgcc,-lpthread,--end-group|g' libzen-config
           make -j"$(nproc)"
 
       - name: Build MediaInfoLib (shared, no libcurl/libmms)
