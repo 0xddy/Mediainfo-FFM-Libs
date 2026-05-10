@@ -76,6 +76,37 @@ jobs:
             --without-libmms
           make -j"$(nproc)"
 
+      - name: Verify ZenLib statically absorbed (pre-strip)
+        run: |
+          set -euo pipefail
+          # Run on the unstripped artifact: --strip-unneeded later removes the .symtab
+          # entries we use to detect the libtool regression below; only the export
+          # table (.dynsym) and DT_NEEDED survive stripping.
+          SRC="$RUNNER_TEMP/mediainfo-build/MediaInfoLib/Project/GNU/Library/.libs/libmediainfo.so.0"
+          test -f "$SRC" || { echo "missing $SRC"; ls -la "$(dirname "$SRC")" || true; exit 1; }
+
+          # (1) Single-file artifact contract: no runtime dependency on libzen.so.*.
+          # If this fires, configure picked the dynamic ZenLib branch and we silently
+          # broke the lock contract (consumers expect one DLL/.so per platform).
+          if readelf -d "$SRC" | grep -E '\(NEEDED\)' | grep -qi libzen ; then
+            echo "ERROR: libmediainfo.so.0 has external libzen.so dependency"
+            readelf -d "$SRC" | grep -E '\(NEEDED\)'
+            exit 1
+          fi
+
+          # (2) Regression guard for the libtool static-absorption bug we just fixed:
+          # ZenLib symbols must be defined inside libmediainfo.so.0. If libtool ever
+          # silently drops the convenience archive again (e.g. upstream resets
+          # installed=yes), this fails fast in CI instead of crashing at runtime with
+          # "undefined symbol: ZenLib::...".
+          if ! nm -C --defined-only "$SRC" | grep -qE 'ZenLib::(Ztring|CriticalSection)' ; then
+            echo "ERROR: ZenLib symbols not absorbed into libmediainfo.so.0"
+            echo "----- ZenLib symbols seen by nm -C (defined or not): -----"
+            nm -C "$SRC" | grep -E 'ZenLib::' | head -20 || true
+            exit 1
+          fi
+          echo "OK: ZenLib statically absorbed; no external libzen.so.* dependency"
+
       - name: Strip and stage binary
         run: |
           set -euo pipefail
@@ -156,22 +187,32 @@ jobs:
           cd "$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/ZenLib/Project/GNU/Library"
           if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
           ./configure --enable-static --disable-shared
-          # MinGW libtool refuses to absorb a raw libzen.a into a downstream DLL:
-          #   "Trying to link with static lib archive .../libzen.a. ... But I can only do
-          #    this if you have a shared version of the library, which you do not appear
-          #    to have because the file extensions .a of this argument makes me believe
-          #    that it is just a static archive that I should not use here."
-          # ZenLib's configure bakes "$(pwd)/.libs/libzen.a -lpthread" into libzen-config's
-          # LIBS_Static output, which MediaInfoLib's configure appends to LIBS verbatim
-          # (configure.ac: "LIBS=\"$LIBS \$(libzen-config LIBS_Static)\""), so libtool
-          # silently drops libzen.a and produces a libmediainfo-0.dll missing every
-          # ZenLib::* symbol. Re-point libzen-config at the libtool .la wrapper instead:
-          # libzen.la has dlname='' + old_library='libzen.a', so MediaInfoLib's libtool
-          # treats ZenLib as a convenience library and absorbs its objects into
-          # libmediainfo-0.dll. Linux ld is more permissive and absorbs the bare .a
-          # already, so this is a no-op there; we only need it on MinGW.
+          # Patch 1/2 (post-configure): re-point libzen-config at the libtool .la wrapper
+          # rather than the bare .a. MediaInfoLib's configure.ac (lines 471-473) appends
+          #   $(libzen-config LIBS_Static)
+          # to LIBS verbatim. Without this patch that becomes ".../.libs/libzen.a", and
+          # MinGW libtool refuses the bare archive ("Trying to link with static lib
+          # archive ... the file extensions .a of this argument makes me believe that it
+          # is just a static archive that I should not use here.") and silently drops it,
+          # leaving every ZenLib::* symbol unresolved in libmediainfo-0.dll.
           sed -i 's|/\.libs/libzen\.a|/libzen.la|g' libzen-config
           make -j"$(nproc)"
+          # Patch 2/2 (post-make): mark libzen.la as a libtool convenience archive
+          # (installed=no) so MediaInfoLib's libtool absorbs its objects into
+          # libmediainfo-0.dll. Even after Patch 1, libtool on MinGW reads the .la with
+          # installed=yes + dlname='' and emits a *different* refusal:
+          #   "This system cannot link to static lib archive .../libzen.la. ... But I
+          #    can only do this if you have a shared version of the library, which you
+          #    do not appear to have."
+          # That branch is hard-coded against linking an *installed* static-only library
+          # into a shared target; a *non-installed* (convenience) static-only library is
+          # explicitly supported and gets its objects copied into the parent .so/.dll.
+          # libzen.la's old_library='libzen.a' is found under ./.libs/ relative to the
+          # .la, which is exactly where libtool looks for convenience archives, so no
+          # path rewrite is needed beyond installed=yes -> installed=no.
+          # (Linux is unaffected: GNU ld absorbs the bare .a regardless of installed=,
+          # and PIC was already enforced by ZenLib/configure.ac for non-mingw builds.)
+          sed -i 's|^installed=yes$|installed=no|' libzen.la
 
       - name: Build MediaInfoLib (shared, no libcurl/libmms)
         shell: msys2 {0}
@@ -185,6 +226,42 @@ jobs:
             --without-libcurl \
             --without-libmms
           make -j"$(nproc)"
+
+      - name: Verify ZenLib statically absorbed (pre-strip)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          # Run on the unstripped artifact: --strip-unneeded later removes the COFF
+          # symbol entries we use to detect the libtool regression below; only the
+          # export table (.edata) and the import table survive stripping.
+          LIBS_DIR="$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/MediaInfoLib/Project/GNU/Library/.libs"
+          SRC=""
+          for cand in libmediainfo-0.dll libmediainfo.dll cygmediainfo-0.dll; do
+            if [ -f "$LIBS_DIR/$cand" ]; then SRC="$LIBS_DIR/$cand"; break; fi
+          done
+          test -n "$SRC" || { echo "Build artifact missing under $LIBS_DIR"; ls -la "$LIBS_DIR" || true; exit 1; }
+
+          # (1) Single-file artifact contract: no runtime dependency on libzen-*.dll.
+          # If this fires, MinGW libtool fell back to the dynamic ZenLib branch and
+          # we silently broke the lock contract.
+          if objdump -p "$SRC" | grep -i 'DLL Name:' | grep -qi libzen ; then
+            echo "ERROR: $(basename "$SRC") has external libzen DLL dependency"
+            objdump -p "$SRC" | grep -i 'DLL Name:'
+            exit 1
+          fi
+
+          # (2) Regression guard for the libtool static-absorption bug we just fixed
+          # (Patch 1: libzen-config -> .la wrapper; Patch 2: libzen.la installed=no).
+          # If MinGW libtool ever drops ZenLib again (upstream changes, libtool
+          # version bump, etc.) the build still "succeeds" but produces a DLL that
+          # crashes at runtime with unresolved ZenLib symbols. This catches it in CI.
+          if ! nm -C --defined-only "$SRC" | grep -qE 'ZenLib::(Ztring|CriticalSection)' ; then
+            echo "ERROR: ZenLib symbols not absorbed into $(basename "$SRC")"
+            echo "----- ZenLib symbols seen by nm -C (defined or not): -----"
+            nm -C "$SRC" | grep -E 'ZenLib::' | head -20 || true
+            exit 1
+          fi
+          echo "OK: ZenLib statically absorbed; no external libzen-*.dll dependency"
 
       - name: Strip and stage binary
         shell: msys2 {0}
