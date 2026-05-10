@@ -1,0 +1,300 @@
+name: MediaInfo Binaries
+
+# 自源码编译 MediaInfoLib + ZenLib，剔除 JNI 桥（MediaInfoJNI.cpp）与 libcurl/libmms，
+# 产物为纯净的 libmediainfo.so.0 + MediaInfo.dll，发布到本仓库 GitHub Release。
+# 消费侧由 gradle/mediainfo-binaries.lock + FetchMediaInfoBinariesTask 按 URL+SHA-256 拉取。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mediainfo_tag:
+        description: "MediaInfoLib upstream tag (e.g. v26.01)"
+        required: true
+        default: "v26.01"
+      zenlib_tag:
+        description: "ZenLib upstream tag (e.g. v0.4.41)"
+        required: true
+        default: "v0.4.41"
+      release_tag:
+        description: "Release tag for produced binaries (e.g. mediainfo-vendored-26.01.0)"
+        required: true
+        default: "mediainfo-vendored-26.01.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake libtool pkg-config build-essential zlib1g-dev binutils file
+
+      - name: Clone upstream sources
+        env:
+          MEDIAINFO_TAG: ${{ inputs.mediainfo_tag }}
+          ZENLIB_TAG: ${{ inputs.zenlib_tag }}
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$RUNNER_TEMP/mediainfo-build"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          git clone --depth=1 --branch "$ZENLIB_TAG" https://github.com/MediaArea/ZenLib
+          git clone --depth=1 --branch "$MEDIAINFO_TAG" https://github.com/MediaArea/MediaInfoLib
+
+      - name: Strip JNI bridge from MediaInfoLib source
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$RUNNER_TEMP/mediainfo-build"
+          JNI_CPP="$BUILD_DIR/MediaInfoLib/Source/MediaInfoDLL/MediaInfoJNI.cpp"
+          test -f "$JNI_CPP" || (echo "Expected JNI source not found: $JNI_CPP"; exit 1)
+          : > "$JNI_CPP"
+          test ! -s "$JNI_CPP"
+          echo "Blanked: $JNI_CPP"
+
+      - name: Build ZenLib (static)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/mediainfo-build/ZenLib/Project/GNU/Library"
+          if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
+          ./configure --enable-static --disable-shared
+          make -j"$(nproc)"
+
+      - name: Build MediaInfoLib (shared, no libcurl/libmms)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/mediainfo-build/MediaInfoLib/Project/GNU/Library"
+          if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
+          ./configure \
+            --enable-shared \
+            --enable-staticlibs \
+            --without-libcurl \
+            --without-libmms
+          make -j"$(nproc)"
+
+      - name: Strip and stage binary
+        run: |
+          set -euo pipefail
+          LIBS_DIR="$RUNNER_TEMP/mediainfo-build/MediaInfoLib/Project/GNU/Library/.libs"
+          SRC="$LIBS_DIR/libmediainfo.so.0"
+          if [ ! -f "$SRC" ]; then
+            echo "Build artifact missing: $SRC"
+            ls -la "$LIBS_DIR" || true
+            exit 1
+          fi
+          strip --strip-unneeded "$SRC"
+          file "$SRC"
+
+          mkdir -p dist
+          cp "$SRC" dist/libmediainfo.so.0
+          sha256sum dist/libmediainfo.so.0 | tee dist/libmediainfo.so.0.sha256
+
+      - name: Verify JNI symbols are gone
+        run: |
+          set -euo pipefail
+          if nm -D --defined-only dist/libmediainfo.so.0 | grep -E "JNI_OnLoad|Java_Mediainfo|Java_MediaInfo" ; then
+            echo "ERROR: JNI symbols still exported"
+            exit 1
+          fi
+          echo "OK: no JNI symbols exported"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediainfo-linux-x86-64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 5
+
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-2022
+    steps:
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            git
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-autotools
+            mingw-w64-x86_64-zlib
+
+      - name: Clone upstream sources
+        shell: msys2 {0}
+        env:
+          MEDIAINFO_TAG: ${{ inputs.mediainfo_tag }}
+          ZENLIB_TAG: ${{ inputs.zenlib_tag }}
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$(cygpath -u "$RUNNER_TEMP")/mediainfo-build"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          git clone --depth=1 --branch "$ZENLIB_TAG" https://github.com/MediaArea/ZenLib
+          git clone --depth=1 --branch "$MEDIAINFO_TAG" https://github.com/MediaArea/MediaInfoLib
+
+      - name: Strip JNI bridge from MediaInfoLib source
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$(cygpath -u "$RUNNER_TEMP")/mediainfo-build"
+          JNI_CPP="$BUILD_DIR/MediaInfoLib/Source/MediaInfoDLL/MediaInfoJNI.cpp"
+          test -f "$JNI_CPP" || (echo "Expected JNI source not found: $JNI_CPP"; exit 1)
+          : > "$JNI_CPP"
+          test ! -s "$JNI_CPP"
+          echo "Blanked: $JNI_CPP"
+
+      - name: Build ZenLib (static)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/ZenLib/Project/GNU/Library"
+          if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
+          ./configure --enable-static --disable-shared
+          make -j"$(nproc)"
+
+      - name: Build MediaInfoLib (shared, no libcurl/libmms)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/MediaInfoLib/Project/GNU/Library"
+          if [ -x ./autogen.sh ]; then ./autogen.sh; else autoreconf -fi; fi
+          ./configure \
+            --enable-shared \
+            --enable-staticlibs \
+            --without-libcurl \
+            --without-libmms
+          make -j"$(nproc)"
+
+      - name: Strip and stage binary
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          LIBS_DIR="$(cygpath -u "$RUNNER_TEMP")/mediainfo-build/MediaInfoLib/Project/GNU/Library/.libs"
+          SRC=""
+          for cand in libmediainfo-0.dll libmediainfo.dll cygmediainfo-0.dll; do
+            if [ -f "$LIBS_DIR/$cand" ]; then SRC="$LIBS_DIR/$cand"; break; fi
+          done
+          if [ -z "$SRC" ]; then
+            echo "Build artifact missing under $LIBS_DIR"
+            ls -la "$LIBS_DIR" || true
+            exit 1
+          fi
+          strip --strip-unneeded "$SRC"
+          file "$SRC"
+
+          DIST="$(cygpath -u "$GITHUB_WORKSPACE")/dist"
+          mkdir -p "$DIST"
+          cp "$SRC" "$DIST/MediaInfo.dll"
+          sha256sum "$DIST/MediaInfo.dll" | tee "$DIST/MediaInfo.dll.sha256"
+
+      - name: Verify JNI symbols are gone
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          DIST="$(cygpath -u "$GITHUB_WORKSPACE")/dist"
+          if objdump -p "$DIST/MediaInfo.dll" | grep -E "JNI_OnLoad|Java_Mediainfo|Java_MediaInfo" ; then
+            echo "ERROR: JNI symbols still exported"
+            exit 1
+          fi
+          echo "OK: no JNI symbols exported"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediainfo-windows-x86-64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-24.04
+    needs: [build-linux, build-windows]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mediainfo-*
+          merge-multiple: true
+          path: dist
+
+      - name: List staged files
+        run: ls -la dist
+
+      - name: Generate release body and lock rows
+        env:
+          MEDIAINFO_TAG: ${{ inputs.mediainfo_tag }}
+          ZENLIB_TAG: ${{ inputs.zenlib_tag }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test -f dist/libmediainfo.so.0
+          test -f dist/MediaInfo.dll
+
+          LINUX_SHA=$(sha256sum dist/libmediainfo.so.0 | awk '{print $1}')
+          WIN_SHA=$(sha256sum dist/MediaInfo.dll | awk '{print $1}')
+          URL_BASE="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
+
+          # 4 列 TSV，TAB 分隔；用 printf 保证真实 TAB 字符
+          {
+            printf 'linux-x86-64\tlibmediainfo.so.0\t%s\t%s/libmediainfo.so.0\n' "$LINUX_SHA" "$URL_BASE"
+            printf 'windows-x86-64\tMediaInfo.dll\t%s\t%s/MediaInfo.dll\n' "$WIN_SHA" "$URL_BASE"
+          } > dist/lock-rows.tsv
+
+          {
+            echo "Self-built MediaInfo native binaries (no JNI bridge, no libcurl, no libmms)."
+            echo
+            echo "- Upstream MediaInfoLib: \`${MEDIAINFO_TAG}\`"
+            echo "- Upstream ZenLib:       \`${ZENLIB_TAG}\`"
+            echo "- Built at commit:       \`${COMMIT}\`"
+            echo
+            echo "## SHA-256"
+            echo
+            echo "| Platform | File | SHA-256 |"
+            echo "| --- | --- | --- |"
+            echo "| linux-x86-64 | libmediainfo.so.0 | \`${LINUX_SHA}\` |"
+            echo "| windows-x86-64 | MediaInfo.dll | \`${WIN_SHA}\` |"
+            echo
+            echo "## Lock rows"
+            echo
+            echo "Paste these lines into \`gradle/mediainfo-binaries.lock\` (fields TAB-separated):"
+            echo
+            echo '```'
+            cat dist/lock-rows.tsv
+            echo '```'
+            echo
+            echo "## License"
+            echo
+            echo "Both MediaInfoLib and ZenLib are BSD-2-Clause."
+            echo "- MediaInfoLib: https://github.com/MediaArea/MediaInfoLib/blob/${MEDIAINFO_TAG}/License.html"
+            echo "- ZenLib:       https://github.com/MediaArea/ZenLib/blob/${ZENLIB_TAG}/License.txt"
+          } > release-body.md
+
+          echo "----- release-body.md -----"
+          cat release-body.md
+          echo "----- lock-rows.tsv -----"
+          cat dist/lock-rows.tsv | od -c | head -20
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: MediaInfo Binaries ${{ inputs.release_tag }}
+          body_path: release-body.md
+          prerelease: false
+          make_latest: false
+          overwrite_files: true
+          files: |
+            dist/libmediainfo.so.0
+            dist/MediaInfo.dll
+            dist/lock-rows.tsv
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
